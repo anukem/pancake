@@ -25,6 +25,7 @@ impl Cli {
             Commands::Init(args) => handle_init(args),
             Commands::Branch(args) => handle_branch(args),
             Commands::Bc(args) => handle_branch_create(args),
+            Commands::Bd(args) => handle_branch_delete(args),
         }
     }
 }
@@ -38,6 +39,9 @@ enum Commands {
     /// Create a new branch in the stack (alias for 'branch create')
     #[command(name = "bc")]
     Bc(BranchCreateArgs),
+    /// Delete a branch from the stack (alias for 'branch delete')
+    #[command(name = "bd")]
+    Bd(BranchDeleteArgs),
 }
 
 #[derive(Args)]
@@ -51,6 +55,9 @@ enum BranchCommands {
     /// Create a new branch in the stack
     #[command(alias = "c")]
     Create(BranchCreateArgs),
+    /// Delete a branch from the stack
+    #[command(alias = "d")]
+    Delete(BranchDeleteArgs),
 }
 
 #[derive(Args)]
@@ -60,6 +67,15 @@ struct BranchCreateArgs {
     /// Specify a different base branch (defaults to current branch)
     #[arg(long)]
     base: Option<String>,
+}
+
+#[derive(Args)]
+struct BranchDeleteArgs {
+    /// Name of the branch to delete
+    branch_name: String,
+    /// Force delete even with unmerged changes
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args)]
@@ -123,7 +139,98 @@ fn handle_init(args: InitArgs) -> Result<()> {
 fn handle_branch(args: BranchArgs) -> Result<()> {
     match args.command {
         BranchCommands::Create(create_args) => handle_branch_create(create_args),
+        BranchCommands::Delete(delete_args) => handle_branch_delete(delete_args),
     }
+}
+
+fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
+    let repo =
+        Repository::discover(".").context("`pk branch delete` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Check if the branch exists
+    if !branch_exists(&repo, &args.branch_name) {
+        bail!("Branch '{}' does not exist", args.branch_name);
+    }
+
+    // Prevent deleting the current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    let current_branch = if head.is_branch() {
+        head.shorthand().map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    if current_branch.as_deref() == Some(&args.branch_name) {
+        bail!("Cannot delete the currently checked out branch '{}'", args.branch_name);
+    }
+
+    // Load stack metadata
+    let mut metadata = StackMetadata::load(&repo_root)?;
+
+    // Get the parent of the branch being deleted
+    let parent = metadata
+        .branches
+        .get(&args.branch_name)
+        .and_then(|m| m.parent.clone());
+
+    // Get all children of the branch being deleted
+    let children = metadata.get_children(&args.branch_name);
+
+    // Restack children onto the deleted branch's parent
+    for child in &children {
+        metadata.update_parent(child, parent.clone());
+        println!("Restacked '{}' onto '{}'", child, parent.as_deref().unwrap_or("main"));
+    }
+
+    // Delete the Git branch
+    let mut branch = repo
+        .find_branch(&args.branch_name, BranchType::Local)
+        .with_context(|| format!("unable to find branch '{}'", args.branch_name))?;
+
+    // Check if the branch is fully merged (unless --force is used)
+    if !args.force {
+        // Try to delete with the unmerged check
+        match branch.delete() {
+            Ok(_) => {},
+            Err(e) => {
+                bail!(
+                    "Branch '{}' has unmerged changes. Use `--force` to delete anyway.\nError: {}",
+                    args.branch_name,
+                    e
+                );
+            }
+        }
+    } else {
+        // Force delete
+        branch.delete()
+            .with_context(|| format!("failed to delete branch '{}'", args.branch_name))?;
+    }
+
+    // Remove from stack metadata
+    metadata.remove_branch(&args.branch_name);
+    metadata.save(&repo_root)?;
+
+    if children.is_empty() {
+        println!("Deleted branch '{}'", args.branch_name);
+    } else {
+        println!(
+            "Deleted branch '{}' and restacked {} child branch(es)",
+            args.branch_name,
+            children.len()
+        );
+    }
+
+    Ok(())
 }
 
 fn handle_branch_create(args: BranchCreateArgs) -> Result<()> {
@@ -321,6 +428,29 @@ impl StackMetadata {
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
+    }
+
+    fn get_children(&self, branch_name: &str) -> Vec<String> {
+        self.branches
+            .iter()
+            .filter_map(|(name, metadata)| {
+                if metadata.parent.as_deref() == Some(branch_name) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn remove_branch(&mut self, branch_name: &str) {
+        self.branches.remove(branch_name);
+    }
+
+    fn update_parent(&mut self, branch_name: &str, new_parent: Option<String>) {
+        if let Some(metadata) = self.branches.get_mut(branch_name) {
+            metadata.parent = new_parent;
+        }
     }
 }
 
