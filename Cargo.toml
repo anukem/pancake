@@ -1,0 +1,16 @@
+[package]
+name = "pk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+git2 = { version = "0.18", default-features = false, features = ["vendored-libgit2", "vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
