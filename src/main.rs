@@ -1,9 +1,9 @@
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use git2::{BranchType, Repository};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 fn main() {
     if let Err(err) = Cli::parse().run() {
@@ -23,6 +23,8 @@ impl Cli {
     fn run(self) -> Result<()> {
         match self.command {
             Commands::Init(args) => handle_init(args),
+            Commands::Branch(args) => handle_branch(args),
+            Commands::Bc(args) => handle_branch_create(args),
         }
     }
 }
@@ -31,6 +33,33 @@ impl Cli {
 enum Commands {
     /// Initialize Pancake in the current repository
     Init(InitArgs),
+    /// Branch management commands
+    Branch(BranchArgs),
+    /// Create a new branch in the stack (alias for 'branch create')
+    #[command(name = "bc")]
+    Bc(BranchCreateArgs),
+}
+
+#[derive(Args)]
+struct BranchArgs {
+    #[command(subcommand)]
+    command: BranchCommands,
+}
+
+#[derive(Subcommand)]
+enum BranchCommands {
+    /// Create a new branch in the stack
+    #[command(alias = "c")]
+    Create(BranchCreateArgs),
+}
+
+#[derive(Args)]
+struct BranchCreateArgs {
+    /// Name of the new branch
+    branch_name: String,
+    /// Specify a different base branch (defaults to current branch)
+    #[arg(long)]
+    base: Option<String>,
 }
 
 #[derive(Args)]
@@ -86,6 +115,82 @@ fn handle_init(args: InitArgs) -> Result<()> {
         display_path(&repo_root),
         main_branch,
         remote
+    );
+
+    Ok(())
+}
+
+fn handle_branch(args: BranchArgs) -> Result<()> {
+    match args.command {
+        BranchCommands::Create(create_args) => handle_branch_create(create_args),
+    }
+}
+
+fn handle_branch_create(args: BranchCreateArgs) -> Result<()> {
+    let repo =
+        Repository::discover(".").context("`pk branch create` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Determine the base branch
+    let base_branch = match args.base {
+        Some(base) => {
+            // Verify the base branch exists
+            if !branch_exists(&repo, &base) {
+                bail!("Base branch '{}' does not exist", base);
+            }
+            base
+        }
+        None => {
+            // Use current branch as base
+            let head = repo.head().context("unable to resolve current HEAD")?;
+            if !head.is_branch() {
+                bail!("HEAD is not currently on a branch. Cannot determine base branch.");
+            }
+            head.shorthand()
+                .ok_or_else(|| anyhow!("unable to get current branch name"))?
+                .to_string()
+        }
+    };
+
+    // Check if the new branch already exists
+    if branch_exists(&repo, &args.branch_name) {
+        bail!("Branch '{}' already exists", args.branch_name);
+    }
+
+    // Create the new branch
+    let base_commit = repo
+        .find_branch(&base_branch, BranchType::Local)
+        .with_context(|| format!("unable to find branch '{}'", base_branch))?
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("unable to get commit for branch '{}'", base_branch))?;
+
+    repo.branch(&args.branch_name, &base_commit, false)
+        .with_context(|| format!("failed to create branch '{}'", args.branch_name))?;
+
+    // Checkout the new branch
+    repo.set_head(&format!("refs/heads/{}", args.branch_name))
+        .context("failed to set HEAD to new branch")?;
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+        .context("failed to checkout new branch")?;
+
+    // Update stack metadata
+    let mut metadata = StackMetadata::load(&repo_root)?;
+    metadata.add_branch(args.branch_name.clone(), Some(base_branch.clone()));
+    metadata.save(&repo_root)?;
+
+    println!(
+        "Created branch '{}' based on '{}' and switched to it",
+        args.branch_name, base_branch
     );
 
     Ok(())
@@ -177,4 +282,50 @@ struct StackConfig<'a> {
 #[derive(Serialize)]
 struct GithubConfig {
     api_token: &'static str,
+}
+
+// Stack metadata structures
+#[derive(Debug, Serialize, Deserialize)]
+struct StackMetadata {
+    branches: HashMap<String, BranchMetadata>,
+}
+
+impl StackMetadata {
+    fn load(repo_root: &Path) -> Result<Self> {
+        let stacks_path = repo_root.join(".pancake/stacks.json");
+        if !stacks_path.exists() {
+            return Ok(Self {
+                branches: HashMap::new(),
+            });
+        }
+
+        let contents = fs::read_to_string(&stacks_path)
+            .with_context(|| format!("failed to read {}", display_path(&stacks_path)))?;
+        serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", display_path(&stacks_path)))
+    }
+
+    fn save(&self, repo_root: &Path) -> Result<()> {
+        let stacks_path = repo_root.join(".pancake/stacks.json");
+        let serialized = serde_json::to_string_pretty(self)
+            .context("failed to serialize stack metadata")?;
+        fs::write(&stacks_path, serialized)
+            .with_context(|| format!("failed to write {}", display_path(&stacks_path)))
+    }
+
+    fn add_branch(&mut self, branch_name: String, parent: Option<String>) {
+        self.branches.insert(
+            branch_name.clone(),
+            BranchMetadata {
+                parent,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            },
+        );
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BranchMetadata {
+    parent: Option<String>,
+    created_at: String,
 }
