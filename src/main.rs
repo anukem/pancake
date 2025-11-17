@@ -2,6 +2,7 @@ use std::{collections::HashMap, fs, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
+use colored::Colorize;
 use git2::{BranchType, Repository};
 use serde::{Deserialize, Serialize};
 
@@ -587,15 +588,29 @@ fn build_branch_node(name: &str, children_map: &HashMap<String, Vec<String>>) ->
 }
 
 fn render_full_view(roots: &[StackRoot]) {
+    // Define a palette of colors to cycle through for different stacks
+    let colors = [
+        colored::Color::Cyan,
+        colored::Color::Green,
+        colored::Color::Yellow,
+        colored::Color::Magenta,
+        colored::Color::Blue,
+        colored::Color::BrightCyan,
+        colored::Color::BrightGreen,
+        colored::Color::BrightYellow,
+    ];
+
     for (idx, root) in roots.iter().enumerate() {
+        let color = colors[idx % colors.len()];
+
         match root {
             StackRoot::ExternalParent { name, children } => {
-                println!("{name}");
-                render_children(children);
+                println!("{}", name.color(color).bold());
+                render_children(children, color);
             }
             StackRoot::Standalone { node } => {
-                println!("{}", node.name);
-                render_children(&node.children);
+                println!("{}", node.name.color(color).bold());
+                render_children(&node.children, color);
             }
         }
 
@@ -605,16 +620,16 @@ fn render_full_view(roots: &[StackRoot]) {
     }
 }
 
-fn render_children(children: &[BranchNode]) {
+fn render_children(children: &[BranchNode], color: colored::Color) {
     for (idx, child) in children.iter().enumerate() {
         let is_last = idx == children.len() - 1;
-        render_branch(child, "", is_last);
+        render_branch(child, "", is_last, color);
     }
 }
 
-fn render_branch(node: &BranchNode, prefix: &str, is_last: bool) {
+fn render_branch(node: &BranchNode, prefix: &str, is_last: bool, color: colored::Color) {
     let connector = if is_last { "`--" } else { "|--" };
-    println!("{prefix}{connector} {}", node.name);
+    println!("{}{} {}", prefix.color(color), connector.color(color), node.name.color(color));
 
     let next_prefix = if is_last {
         format!("{prefix}    ")
@@ -624,14 +639,29 @@ fn render_branch(node: &BranchNode, prefix: &str, is_last: bool) {
 
     for (idx, child) in node.children.iter().enumerate() {
         let child_is_last = idx == node.children.len() - 1;
-        render_branch(child, &next_prefix, child_is_last);
+        render_branch(child, &next_prefix, child_is_last, color);
     }
 }
 
 fn render_short_view(roots: &[StackRoot]) {
-    let mut lines = Vec::new();
+    // Define a palette of colors to cycle through for different stacks
+    let colors = [
+        colored::Color::Cyan,
+        colored::Color::Green,
+        colored::Color::Yellow,
+        colored::Color::Magenta,
+        colored::Color::Blue,
+        colored::Color::BrightCyan,
+        colored::Color::BrightGreen,
+        colored::Color::BrightYellow,
+    ];
 
-    for root in roots {
+    let mut stack_lines = Vec::new();
+
+    for (idx, root) in roots.iter().enumerate() {
+        let color = colors[idx % colors.len()];
+        let mut lines = Vec::new();
+
         match root {
             StackRoot::ExternalParent { name, children } => {
                 for child in children {
@@ -642,10 +672,19 @@ fn render_short_view(roots: &[StackRoot]) {
                 collect_paths(node, Vec::new(), &mut lines);
             }
         }
+
+        stack_lines.push((lines, color));
     }
 
-    for line in lines {
-        println!("{}", line.join(" -> "));
+    for (lines, color) in stack_lines {
+        for line in lines {
+            let colored_line = line
+                .iter()
+                .map(|s| s.color(color).to_string())
+                .collect::<Vec<_>>()
+                .join(&format!(" {} ", "->".color(color)));
+            println!("{}", colored_line);
+        }
     }
 }
 
