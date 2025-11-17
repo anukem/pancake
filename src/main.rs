@@ -26,6 +26,7 @@ impl Cli {
             Commands::Branch(args) => handle_branch(args),
             Commands::Bc(args) => handle_branch_create(args),
             Commands::Bd(args) => handle_branch_delete(args),
+            Commands::Log(args) => handle_log(args),
         }
     }
 }
@@ -42,6 +43,9 @@ enum Commands {
     /// Delete a branch from the stack (alias for 'branch delete')
     #[command(name = "bd")]
     Bd(BranchDeleteArgs),
+    /// Show the tracked stacks in ASCII form
+    #[command(name = "log", alias = "l")]
+    Log(LogArgs),
 }
 
 #[derive(Args)]
@@ -76,6 +80,16 @@ struct BranchDeleteArgs {
     /// Force delete even with unmerged changes
     #[arg(long)]
     force: bool,
+}
+
+#[derive(Args)]
+struct LogArgs {
+    /// Show all stacks (currently the default behavior)
+    #[arg(long = "all")]
+    _all: bool,
+    /// Print a condensed representation
+    #[arg(long)]
+    short: bool,
 }
 
 #[derive(Args)]
@@ -141,6 +155,35 @@ fn handle_branch(args: BranchArgs) -> Result<()> {
         BranchCommands::Create(create_args) => handle_branch_create(create_args),
         BranchCommands::Delete(delete_args) => handle_branch_delete(delete_args),
     }
+}
+
+fn handle_log(args: LogArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk log` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    let metadata = StackMetadata::load(&repo_root)?;
+    if metadata.branches.is_empty() {
+        println!("No tracked stacks yet. Create one with `pk branch create <name>`.");
+        return Ok(());
+    }
+
+    let forest = build_stack_forest(&metadata);
+    if args.short {
+        render_short_view(&forest);
+    } else {
+        render_full_view(&forest);
+    }
+
+    Ok(())
 }
 
 fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
@@ -458,4 +501,161 @@ impl StackMetadata {
 struct BranchMetadata {
     parent: Option<String>,
     created_at: String,
+}
+
+#[derive(Debug)]
+enum StackRoot {
+    ExternalParent { name: String, children: Vec<BranchNode> },
+    Standalone { node: BranchNode },
+}
+
+#[derive(Debug)]
+struct BranchNode {
+    name: String,
+    children: Vec<BranchNode>,
+}
+
+fn build_stack_forest(metadata: &StackMetadata) -> Vec<StackRoot> {
+    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut external_roots: HashMap<String, Vec<String>> = HashMap::new();
+    let mut standalone_roots: Vec<String> = Vec::new();
+
+    for (name, branch) in &metadata.branches {
+        match &branch.parent {
+            Some(parent) => {
+                if metadata.branches.contains_key(parent) {
+                    children_map
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(name.clone());
+                } else {
+                    external_roots
+                        .entry(parent.clone())
+                        .or_default()
+                        .push(name.clone());
+                }
+            }
+            None => standalone_roots.push(name.clone()),
+        }
+    }
+
+    for children in children_map.values_mut() {
+        children.sort();
+    }
+    for children in external_roots.values_mut() {
+        children.sort();
+    }
+    standalone_roots.sort();
+
+    let mut roots: Vec<StackRoot> = Vec::new();
+
+    let mut external_names: Vec<_> = external_roots.keys().cloned().collect();
+    external_names.sort();
+    for name in external_names {
+        let children = external_roots
+            .get(&name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|child| build_branch_node(&child, &children_map))
+            .collect();
+        roots.push(StackRoot::ExternalParent { name, children });
+    }
+
+    for branch_name in standalone_roots {
+        roots.push(StackRoot::Standalone {
+            node: build_branch_node(&branch_name, &children_map),
+        });
+    }
+
+    roots
+}
+
+fn build_branch_node(name: &str, children_map: &HashMap<String, Vec<String>>) -> BranchNode {
+    let child_names = children_map.get(name);
+    let mut children = Vec::new();
+    if let Some(names) = child_names {
+        for child in names {
+            children.push(build_branch_node(child, children_map));
+        }
+    }
+
+    BranchNode {
+        name: name.to_string(),
+        children,
+    }
+}
+
+fn render_full_view(roots: &[StackRoot]) {
+    for (idx, root) in roots.iter().enumerate() {
+        match root {
+            StackRoot::ExternalParent { name, children } => {
+                println!("{name}");
+                render_children(children);
+            }
+            StackRoot::Standalone { node } => {
+                println!("{}", node.name);
+                render_children(&node.children);
+            }
+        }
+
+        if idx + 1 < roots.len() {
+            println!();
+        }
+    }
+}
+
+fn render_children(children: &[BranchNode]) {
+    for (idx, child) in children.iter().enumerate() {
+        let is_last = idx == children.len() - 1;
+        render_branch(child, "", is_last);
+    }
+}
+
+fn render_branch(node: &BranchNode, prefix: &str, is_last: bool) {
+    let connector = if is_last { "`--" } else { "|--" };
+    println!("{prefix}{connector} {}", node.name);
+
+    let next_prefix = if is_last {
+        format!("{prefix}    ")
+    } else {
+        format!("{prefix}|   ")
+    };
+
+    for (idx, child) in node.children.iter().enumerate() {
+        let child_is_last = idx == node.children.len() - 1;
+        render_branch(child, &next_prefix, child_is_last);
+    }
+}
+
+fn render_short_view(roots: &[StackRoot]) {
+    let mut lines = Vec::new();
+
+    for root in roots {
+        match root {
+            StackRoot::ExternalParent { name, children } => {
+                for child in children {
+                    collect_paths(child, vec![name.clone()], &mut lines);
+                }
+            }
+            StackRoot::Standalone { node } => {
+                collect_paths(node, Vec::new(), &mut lines);
+            }
+        }
+    }
+
+    for line in lines {
+        println!("{}", line.join(" -> "));
+    }
+}
+
+fn collect_paths(node: &BranchNode, mut current: Vec<String>, output: &mut Vec<Vec<String>>) {
+    current.push(node.name.clone());
+    if node.children.is_empty() {
+        output.push(current);
+    } else {
+        for child in &node.children {
+            collect_paths(child, current.clone(), output);
+        }
+    }
 }
