@@ -27,6 +27,10 @@ impl Cli {
             Commands::Bc(args) => handle_branch_create(args),
             Commands::Bd(args) => handle_branch_delete(args),
             Commands::Log(args) => handle_log(args),
+            Commands::Up(args) => handle_up(args),
+            Commands::Down(args) => handle_down(args),
+            Commands::Top => handle_top(),
+            Commands::Bottom => handle_bottom(),
         }
     }
 }
@@ -46,6 +50,16 @@ enum Commands {
     /// Show the tracked stacks in ASCII form
     #[command(name = "log", alias = "l")]
     Log(LogArgs),
+    /// Navigate up the stack (to a child branch)
+    #[command(alias = "u")]
+    Up(UpArgs),
+    /// Navigate down the stack (to the parent branch)
+    #[command(alias = "d")]
+    Down(DownArgs),
+    /// Navigate to the topmost branch in the current stack
+    Top,
+    /// Navigate to the bottom of the current stack (just above main)
+    Bottom,
 }
 
 #[derive(Args)]
@@ -90,6 +104,18 @@ struct LogArgs {
     /// Print a condensed representation
     #[arg(long)]
     short: bool,
+}
+
+#[derive(Args)]
+struct UpArgs {
+    /// Number of branches to move up the stack (towards children, default: 1)
+    count: Option<usize>,
+}
+
+#[derive(Args)]
+struct DownArgs {
+    /// Number of branches to move down the stack (towards parents, default: 1)
+    count: Option<usize>,
 }
 
 #[derive(Args)]
@@ -346,6 +372,235 @@ fn handle_branch_create(args: BranchCreateArgs) -> Result<()> {
     Ok(())
 }
 
+fn handle_up(args: UpArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk up` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Get current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    // Load stack metadata
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    // Navigate up (to children) the specified number of times
+    let count = args.count.unwrap_or(1);
+    let mut target = current_branch.clone();
+
+    for i in 0..count {
+        let children = metadata.get_children(&target);
+
+        if children.is_empty() {
+            if i == 0 {
+                bail!("Branch '{}' has no children in the stack", current_branch);
+            } else {
+                bail!("Cannot move up {} branches (only moved {})", count, i);
+            }
+        } else if children.len() == 1 {
+            target = children[0].clone();
+        } else {
+            // Multiple children - need to select one
+            if count > 1 {
+                bail!(
+                    "Branch '{}' has multiple children. Cannot automatically navigate up {} branches.",
+                    target,
+                    count
+                );
+            }
+
+            println!("Branch '{}' has multiple children. Select one:", target);
+            for (idx, child) in children.iter().enumerate() {
+                println!("  {}: {}", idx + 1, child);
+            }
+
+            // For now, bail with a helpful message
+            // In the future, we could use an interactive selector
+            bail!("Multiple children found. Interactive selection not yet implemented.\nUse `pk checkout <branch-name>` to select a specific branch.");
+        }
+    }
+
+    // Checkout the target branch
+    checkout_branch(&repo, &target)?;
+    println!("Switched to branch '{}'", target);
+
+    Ok(())
+}
+
+fn handle_down(args: DownArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk down` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Get current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    // Load stack metadata
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    // Navigate down (to parents) the specified number of times
+    let count = args.count.unwrap_or(1);
+    let mut target = current_branch.clone();
+
+    for i in 0..count {
+        match metadata.get_parent(&target) {
+            Some(parent) => {
+                // Check if the parent is tracked in Pancake
+                if !metadata.branches.contains_key(&parent) {
+                    if i == 0 {
+                        bail!("Branch '{}' has no parent in the stack", current_branch);
+                    } else {
+                        bail!("Cannot move down {} branches (only moved {})", count, i);
+                    }
+                }
+                target = parent;
+            }
+            None => {
+                if i == 0 {
+                    bail!("Branch '{}' has no parent in the stack", current_branch);
+                } else {
+                    bail!("Cannot move down {} branches (only moved {})", count, i);
+                }
+            }
+        }
+    }
+
+    // Checkout the target branch
+    checkout_branch(&repo, &target)?;
+    println!("Switched to branch '{}'", target);
+
+    Ok(())
+}
+
+fn handle_top() -> Result<()> {
+    let repo = Repository::discover(".").context("`pk top` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Get current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    // Load stack metadata
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    // Check if current branch is tracked
+    if !metadata.branches.contains_key(&current_branch) {
+        bail!("Current branch '{}' is not tracked by Pancake", current_branch);
+    }
+
+    // Find the top of the stack
+    let top_branch = metadata.find_stack_top(&current_branch);
+
+    if top_branch == current_branch {
+        println!("Already at the top of the stack: '{}'", current_branch);
+        return Ok(());
+    }
+
+    // Checkout the top branch
+    checkout_branch(&repo, &top_branch)?;
+    println!("Switched to branch '{}' (top of stack)", top_branch);
+
+    Ok(())
+}
+
+fn handle_bottom() -> Result<()> {
+    let repo = Repository::discover(".").context("`pk bottom` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Get current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    // Load stack metadata
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    // Check if current branch is tracked
+    if !metadata.branches.contains_key(&current_branch) {
+        bail!("Current branch '{}' is not tracked by Pancake", current_branch);
+    }
+
+    // Find the bottom of the stack
+    let bottom_branch = metadata.find_stack_bottom(&current_branch);
+
+    if bottom_branch == current_branch {
+        println!("Already at the bottom of the stack: '{}'", current_branch);
+        return Ok(());
+    }
+
+    // Checkout the bottom branch
+    checkout_branch(&repo, &bottom_branch)?;
+    println!("Switched to branch '{}' (bottom of stack)", bottom_branch);
+
+    Ok(())
+}
+
+fn checkout_branch(repo: &Repository, branch_name: &str) -> Result<()> {
+    repo.set_head(&format!("refs/heads/{}", branch_name))
+        .with_context(|| format!("failed to set HEAD to branch '{}'", branch_name))?;
+    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
+        .with_context(|| format!("failed to checkout branch '{}'", branch_name))?;
+    Ok(())
+}
+
 fn detect_main_branch(repo: &Repository) -> Result<String> {
     for candidate in ["main", "master", "develop"] {
         if branch_exists(repo, candidate) {
@@ -494,6 +749,41 @@ impl StackMetadata {
         if let Some(metadata) = self.branches.get_mut(branch_name) {
             metadata.parent = new_parent;
         }
+    }
+
+    fn get_parent(&self, branch_name: &str) -> Option<String> {
+        self.branches
+            .get(branch_name)
+            .and_then(|m| m.parent.clone())
+    }
+
+    fn find_stack_top(&self, branch_name: &str) -> String {
+        let mut current = branch_name.to_string();
+        loop {
+            let children = self.get_children(&current);
+            if children.is_empty() {
+                return current;
+            }
+            // If there are multiple children, we've reached the top for this path
+            if children.len() > 1 {
+                return current;
+            }
+            current = children[0].clone();
+        }
+    }
+
+    fn find_stack_bottom(&self, branch_name: &str) -> String {
+        let mut current = branch_name.to_string();
+        while let Some(parent) = self.get_parent(&current) {
+            // Only navigate to parents that are tracked
+            if self.branches.contains_key(&parent) {
+                current = parent;
+            } else {
+                // Stop at the first untracked parent
+                break;
+            }
+        }
+        current
     }
 }
 
