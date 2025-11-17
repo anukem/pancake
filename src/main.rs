@@ -32,6 +32,7 @@ impl Cli {
             Commands::Down(args) => handle_down(args),
             Commands::Top => handle_top(),
             Commands::Bottom => handle_bottom(),
+            Commands::Commit(args) => handle_commit(args),
         }
     }
 }
@@ -61,6 +62,9 @@ enum Commands {
     Top,
     /// Navigate to the bottom of the current stack (just above main)
     Bottom,
+    /// Create a commit in the current branch
+    #[command(alias = "c")]
+    Commit(CommitArgs),
 }
 
 #[derive(Args)]
@@ -130,6 +134,19 @@ struct InitArgs {
     /// Explicitly set the Git remote to use
     #[arg(long)]
     remote: Option<String>,
+}
+
+#[derive(Args)]
+struct CommitArgs {
+    /// Commit message
+    #[arg(short, long)]
+    message: Option<String>,
+    /// Stage all changes before committing
+    #[arg(short, long)]
+    all: bool,
+    /// Amend the last commit
+    #[arg(long)]
+    amend: bool,
 }
 
 fn handle_init(args: InitArgs) -> Result<()> {
@@ -590,6 +607,96 @@ fn handle_bottom() -> Result<()> {
     // Checkout the bottom branch
     checkout_branch(&repo, &bottom_branch)?;
     println!("Switched to branch '{}' (bottom of stack)", bottom_branch);
+
+    Ok(())
+}
+
+fn handle_commit(args: CommitArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk commit` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    // Ensure Pancake is initialized
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    // Get current branch
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    // Get the commit message
+    let message = match args.message {
+        Some(msg) => msg,
+        None => {
+            bail!("Commit message is required. Use `-m <message>` to provide one.");
+        }
+    };
+
+    // Stage changes if --all is specified
+    if args.all {
+        let mut index = repo.index().context("failed to get repository index")?;
+        index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .context("failed to stage changes")?;
+        index.write().context("failed to write index")?;
+    }
+
+    // Get the signature for the commit
+    let signature = repo.signature()
+        .context("failed to get git signature. Ensure git user.name and user.email are configured.")?;
+
+    if args.amend {
+        // Amend the last commit
+        let head_commit = head.peel_to_commit()
+            .context("failed to get HEAD commit")?;
+
+        // Get the current index tree
+        let mut index = repo.index().context("failed to get repository index")?;
+        let tree_oid = index.write_tree().context("failed to write tree")?;
+        let tree = repo.find_tree(tree_oid).context("failed to find tree")?;
+
+        // Amend the commit
+        head_commit.amend(
+            Some("HEAD"),
+            Some(&signature),
+            Some(&signature),
+            None,
+            Some(&message),
+            Some(&tree),
+        ).context("failed to amend commit")?;
+
+        println!("Amended commit on branch '{}'", current_branch);
+    } else {
+        // Create a new commit
+        let mut index = repo.index().context("failed to get repository index")?;
+        let tree_oid = index.write_tree().context("failed to write tree")?;
+        let tree = repo.find_tree(tree_oid).context("failed to find tree")?;
+
+        // Get the parent commit (HEAD)
+        let parent_commit = head.peel_to_commit()
+            .context("failed to get parent commit")?;
+
+        // Create the commit
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            &message,
+            &tree,
+            &[&parent_commit],
+        ).context("failed to create commit")?;
+
+        println!("Created commit on branch '{}'", current_branch);
+    }
 
     Ok(())
 }
