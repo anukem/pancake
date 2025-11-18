@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
@@ -33,6 +38,8 @@ impl Cli {
             Commands::Top => handle_top(),
             Commands::Bottom => handle_bottom(),
             Commands::Commit(args) => handle_commit(args),
+            Commands::Sync(args) => handle_sync(args),
+            Commands::Restack(args) => handle_restack(args),
         }
     }
 }
@@ -65,6 +72,11 @@ enum Commands {
     /// Create a commit in the current branch
     #[command(alias = "c")]
     Commit(CommitArgs),
+    /// Sync the current branch (and optionally the entire stack)
+    #[command(alias = "s")]
+    Sync(SyncArgs),
+    /// Restack the entire stack from bottom to top
+    Restack(RestackArgs),
 }
 
 #[derive(Args)]
@@ -147,6 +159,32 @@ struct CommitArgs {
     /// Amend the last commit
     #[arg(long)]
     amend: bool,
+}
+
+#[derive(Args)]
+struct SyncArgs {
+    /// Sync every branch in the current stack (start from the bottom)
+    #[arg(long)]
+    all: bool,
+    /// Treat the configured main branch as the sync base (implies --all)
+    #[arg(long = "from-main")]
+    from_main: bool,
+    /// Continue an in-progress sync after resolving conflicts
+    #[arg(long = "continue")]
+    continue_rebase: bool,
+    /// Abort the in-progress sync
+    #[arg(long)]
+    abort: bool,
+}
+
+#[derive(Args)]
+struct RestackArgs {
+    /// Continue an in-progress restack after resolving conflicts
+    #[arg(long = "continue")]
+    continue_rebase: bool,
+    /// Abort the in-progress restack
+    #[arg(long)]
+    abort: bool,
 }
 
 fn handle_init(args: InitArgs) -> Result<()> {
@@ -701,6 +739,126 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
     Ok(())
 }
 
+fn handle_sync(args: SyncArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk sync` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    if args.continue_rebase && args.abort {
+        bail!("Cannot use --continue and --abort together.");
+    }
+
+    if (args.continue_rebase || args.abort) && (args.all || args.from_main) {
+        bail!("Cannot combine --continue/--abort with --all/--from-main.");
+    }
+
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    if args.continue_rebase {
+        return continue_operation(&repo, &repo_root, &metadata, OperationKind::Sync);
+    }
+
+    if args.abort {
+        return abort_operation(&repo_root, OperationKind::Sync);
+    }
+
+    ensure_no_active_operation(&repo_root)?;
+
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    if !metadata.branches.contains_key(&current_branch) {
+        bail!(
+            "Current branch '{}' is not tracked by Pancake",
+            current_branch
+        );
+    }
+
+    let start_branch = if args.all || args.from_main {
+        metadata.find_stack_bottom(&current_branch)
+    } else {
+        current_branch.clone()
+    };
+
+    let branches = collect_branch_sequence(&metadata, &start_branch);
+    if branches.is_empty() {
+        bail!("No tracked branches to sync starting from '{}'", start_branch);
+    }
+
+    let state = PendingOperation::new(OperationKind::Sync, branches, current_branch);
+    execute_operation(&repo, &repo_root, &metadata, state)
+}
+
+fn handle_restack(args: RestackArgs) -> Result<()> {
+    let repo = Repository::discover(".").context("`pk restack` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    let config_path = repo_root.join(".pancake/config");
+    if !config_path.exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+
+    if args.continue_rebase && args.abort {
+        bail!("Cannot use --continue and --abort together.");
+    }
+
+    let metadata = StackMetadata::load(&repo_root)?;
+
+    if args.continue_rebase {
+        return continue_operation(&repo, &repo_root, &metadata, OperationKind::Restack);
+    }
+
+    if args.abort {
+        return abort_operation(&repo_root, OperationKind::Restack);
+    }
+
+    ensure_no_active_operation(&repo_root)?;
+
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    let current_branch = head
+        .shorthand()
+        .ok_or_else(|| anyhow!("unable to get current branch name"))?
+        .to_string();
+
+    if !metadata.branches.contains_key(&current_branch) {
+        bail!(
+            "Current branch '{}' is not tracked by Pancake",
+            current_branch
+        );
+    }
+
+    let bottom_branch = metadata.find_stack_bottom(&current_branch);
+    let branches = collect_branch_sequence(&metadata, &bottom_branch);
+    if branches.is_empty() {
+        bail!(
+            "No tracked branches to restack starting from '{}'",
+            bottom_branch
+        );
+    }
+
+    let state = PendingOperation::new(OperationKind::Restack, branches, current_branch);
+    execute_operation(&repo, &repo_root, &metadata, state)
+}
+
 fn checkout_branch(repo: &Repository, branch_name: &str) -> Result<()> {
     repo.set_head(&format!("refs/heads/{}", branch_name))
         .with_context(|| format!("failed to set HEAD to branch '{}'", branch_name))?;
@@ -742,6 +900,302 @@ fn branch_exists(repo: &Repository, name: &str) -> bool {
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+enum OperationKind {
+    Sync,
+    Restack,
+}
+
+impl OperationKind {
+    fn name(&self) -> &'static str {
+        match self {
+            OperationKind::Sync => "sync",
+            OperationKind::Restack => "restack",
+        }
+    }
+
+    fn command_name(&self) -> &'static str {
+        match self {
+            OperationKind::Sync => "pk sync",
+            OperationKind::Restack => "pk restack",
+        }
+    }
+
+    fn past_tense(&self) -> &'static str {
+        match self {
+            OperationKind::Sync => "Synced",
+            OperationKind::Restack => "Restacked",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingOperation {
+    kind: OperationKind,
+    branches: Vec<String>,
+    current_index: usize,
+    original_branch: String,
+}
+
+impl PendingOperation {
+    fn new(kind: OperationKind, branches: Vec<String>, original_branch: String) -> Self {
+        Self {
+            kind,
+            branches,
+            current_index: 0,
+            original_branch,
+        }
+    }
+
+    fn path(repo_root: &Path) -> PathBuf {
+        repo_root.join(".pancake/operation_state.json")
+    }
+
+    fn load(repo_root: &Path) -> Result<Option<Self>> {
+        let path = Self::path(repo_root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", display_path(&path)))?;
+        let parsed = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", display_path(&path)))?;
+        Ok(Some(parsed))
+    }
+
+    fn save(&self, repo_root: &Path) -> Result<()> {
+        let path = Self::path(repo_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", display_path(parent)))?;
+        }
+        let serialized = serde_json::to_string_pretty(self)
+            .context("failed to serialize pending operation state")?;
+        fs::write(&path, serialized)
+            .with_context(|| format!("failed to write {}", display_path(&path)))
+    }
+
+    fn clear(repo_root: &Path) -> Result<()> {
+        let path = Self::path(repo_root);
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", display_path(&path)))?;
+        }
+        Ok(())
+    }
+}
+
+fn ensure_no_active_operation(repo_root: &Path) -> Result<()> {
+    if let Some(existing) = PendingOperation::load(repo_root)? {
+        bail!(
+            "A {} operation is already in progress. Use `{} --continue` or `{} --abort`.",
+            existing.kind.name(),
+            existing.kind.command_name(),
+            existing.kind.command_name(),
+        );
+    }
+    Ok(())
+}
+
+fn collect_branch_sequence(metadata: &StackMetadata, start_branch: &str) -> Vec<String> {
+    fn dfs(metadata: &StackMetadata, branch: &str, acc: &mut Vec<String>) {
+        acc.push(branch.to_string());
+        let mut children = metadata.get_children(branch);
+        children.sort();
+        for child in children {
+            dfs(metadata, &child, acc);
+        }
+    }
+
+    let mut branches = Vec::new();
+    if metadata.branches.contains_key(start_branch) {
+        dfs(metadata, start_branch, &mut branches);
+    }
+    branches
+}
+
+fn execute_operation(
+    repo: &Repository,
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    mut state: PendingOperation,
+) -> Result<()> {
+    if state.branches.is_empty() {
+        println!("Nothing to {}.", state.kind.name());
+        return Ok(());
+    }
+
+    state.save(repo_root)?;
+    process_pending_operation(repo, repo_root, metadata, &mut state)?;
+    finalize_operation(repo_root, &state)
+}
+
+fn continue_operation(
+    repo: &Repository,
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    kind: OperationKind,
+) -> Result<()> {
+    let mut state = PendingOperation::load(repo_root)?
+        .ok_or_else(|| anyhow!("No {} operation is currently in progress.", kind.name()))?;
+
+    if state.kind != kind {
+        bail!(
+            "A {} operation is in progress. Use `{} --continue` or `{} --abort`.",
+            state.kind.name(),
+            state.kind.command_name(),
+            state.kind.command_name(),
+        );
+    }
+
+    if state.current_index >= state.branches.len() {
+        return finalize_operation(repo_root, &state);
+    }
+
+    run_git_checked(repo_root, &["rebase", "--continue"])?;
+    state.current_index += 1;
+    state.save(repo_root)?;
+    process_pending_operation(repo, repo_root, metadata, &mut state)?;
+    finalize_operation(repo_root, &state)
+}
+
+fn abort_operation(repo_root: &Path, kind: OperationKind) -> Result<()> {
+    let state = PendingOperation::load(repo_root)?
+        .ok_or_else(|| anyhow!("No {} operation is currently in progress.", kind.name()))?;
+
+    if state.kind != kind {
+        bail!(
+            "A {} operation is in progress. Use `{} --abort`.",
+            state.kind.name(),
+            state.kind.command_name(),
+        );
+    }
+
+    run_git_checked(repo_root, &["rebase", "--abort"])?;
+    PendingOperation::clear(repo_root)?;
+    println!("Aborted {} operation.", kind.name());
+    Ok(())
+}
+
+fn finalize_operation(repo_root: &Path, state: &PendingOperation) -> Result<()> {
+    PendingOperation::clear(repo_root)?;
+    checkout_git_branch(repo_root, &state.original_branch)?;
+    println!(
+        "{} {} branch(es): {}",
+        state.kind.past_tense(),
+        state.branches.len(),
+        state.branches.join(" -> ")
+    );
+    Ok(())
+}
+
+fn process_pending_operation(
+    repo: &Repository,
+    repo_root: &Path,
+    metadata: &StackMetadata,
+    state: &mut PendingOperation,
+) -> Result<()> {
+    while state.current_index < state.branches.len() {
+        let branch = state.branches[state.current_index].clone();
+
+        if !branch_exists(repo, &branch) {
+            bail!("Branch '{}' no longer exists", branch);
+        }
+
+        let parent = metadata
+            .get_parent(&branch)
+            .ok_or_else(|| anyhow!("Branch '{}' has no recorded parent", branch))?;
+
+        checkout_git_branch(repo_root, &branch)?;
+        println!("Rebasing '{}' onto '{}'", branch, parent);
+
+        let output = run_git_command(repo_root, &["rebase", parent.as_str()])?;
+        if !output.status.success() {
+            return Err(build_rebase_failure_message(&branch, &parent, &state.kind, &output));
+        }
+
+        state.current_index += 1;
+        state.save(repo_root)?;
+    }
+
+    Ok(())
+}
+
+fn build_rebase_failure_message(
+    branch: &str,
+    parent: &str,
+    kind: &OperationKind,
+    output: &std::process::Output,
+) -> anyhow::Error {
+    let mut message = format!(
+        "Git rebase failed while rebasing '{}' onto '{}'. Resolve the conflicts, then run `{} --continue` (or `{} --abort`).",
+        branch,
+        parent,
+        kind.command_name(),
+        kind.command_name(),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else if !stdout.trim().is_empty() {
+        stdout.trim().to_string()
+    } else {
+        String::new()
+    };
+
+    if !details.is_empty() {
+        message.push_str(&format!("\n\nGit output:\n{}", details));
+    }
+
+    anyhow!(message)
+}
+
+fn checkout_git_branch(repo_root: &Path, branch: &str) -> Result<()> {
+    let output = run_git_command(repo_root, &["checkout", branch])?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format_git_error(&["checkout", branch], &output))
+    }
+}
+
+fn run_git_checked(repo_root: &Path, args: &[&str]) -> Result<()> {
+    let output = run_git_command(repo_root, args)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format_git_error(args, &output))
+    }
+}
+
+fn run_git_command(repo_root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))
+}
+
+fn format_git_error(args: &[&str], output: &std::process::Output) -> anyhow::Error {
+    let mut message = format!("`git {}` failed", args.join(" "));
+    if let Some(code) = output.status.code() {
+        message.push_str(&format!(" with exit code {}", code));
+    }
+    message.push('.');
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stderr.trim().is_empty() {
+        message.push_str(&format!("\n\nGit stderr:\n{}", stderr.trim()));
+    } else if !stdout.trim().is_empty() {
+        message.push_str(&format!("\n\nGit stdout:\n{}", stdout.trim()));
+    }
+
+    anyhow!(message)
 }
 
 #[derive(Serialize)]
