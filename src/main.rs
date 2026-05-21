@@ -31,7 +31,9 @@ impl Cli {
             Commands::Init(args) => handle_init(args),
             Commands::Branch(args) => handle_branch(args),
             Commands::Bc(args) => handle_branch_create(args),
+            Commands::Br(args) => handle_branch_rename(args),
             Commands::Bd(args) => handle_branch_delete(args),
+            Commands::Co(args) => handle_branch_checkout(args),
             Commands::Log(args) => handle_log(args),
             Commands::Up(args) => handle_up(args),
             Commands::Down(args) => handle_down(args),
@@ -53,9 +55,15 @@ enum Commands {
     /// Create a new branch in the stack (alias for 'branch create')
     #[command(name = "bc")]
     Bc(BranchCreateArgs),
+    /// Rename the current branch in the stack (alias for 'branch rename')
+    #[command(name = "br")]
+    Br(BranchRenameArgs),
     /// Delete a branch from the stack (alias for 'branch delete')
     #[command(name = "bd")]
     Bd(BranchDeleteArgs),
+    /// Checkout a branch in the stack (alias for 'branch checkout')
+    #[command(name = "co")]
+    Co(BranchCheckoutArgs),
     /// Show the tracked stacks in ASCII form
     #[command(name = "log", alias = "l")]
     Log(LogArgs),
@@ -90,9 +98,15 @@ enum BranchCommands {
     /// Create a new branch in the stack
     #[command(alias = "c")]
     Create(BranchCreateArgs),
+    /// Rename the current branch in the stack
+    #[command(alias = "r")]
+    Rename(BranchRenameArgs),
     /// Delete a branch from the stack
     #[command(alias = "d")]
     Delete(BranchDeleteArgs),
+    /// Checkout a branch in the current stack
+    #[command(alias = "co")]
+    Checkout(BranchCheckoutArgs),
 }
 
 #[derive(Args)]
@@ -102,6 +116,24 @@ struct BranchCreateArgs {
     /// Specify a different base branch (defaults to current branch)
     #[arg(long)]
     base: Option<String>,
+    /// Insert the new branch before the specified tracked branch
+    #[arg(long = "insert-before", conflicts_with_all = ["base", "insert_after"])]
+    insert_before: Option<String>,
+    /// Insert the new branch after the specified tracked branch
+    #[arg(long = "insert-after", conflicts_with_all = ["base", "insert_before"])]
+    insert_after: Option<String>,
+}
+
+#[derive(Args)]
+struct BranchRenameArgs {
+    /// New name for the current branch
+    new_name: String,
+}
+
+#[derive(Args)]
+struct BranchCheckoutArgs {
+    /// Branch name, or a unique substring of a tracked branch name
+    branch_name: String,
 }
 
 #[derive(Args)]
@@ -235,7 +267,9 @@ fn handle_init(args: InitArgs) -> Result<()> {
 fn handle_branch(args: BranchArgs) -> Result<()> {
     match args.command {
         BranchCommands::Create(create_args) => handle_branch_create(create_args),
+        BranchCommands::Rename(rename_args) => handle_branch_rename(rename_args),
         BranchCommands::Delete(delete_args) => handle_branch_delete(delete_args),
+        BranchCommands::Checkout(checkout_args) => handle_branch_checkout(checkout_args),
     }
 }
 
@@ -269,8 +303,8 @@ fn handle_log(args: LogArgs) -> Result<()> {
 }
 
 fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
-    let repo =
-        Repository::discover(".").context("`pk branch delete` must be run inside a Git repository")?;
+    let repo = Repository::discover(".")
+        .context("`pk branch delete` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -296,7 +330,10 @@ fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
     };
 
     if current_branch.as_deref() == Some(&args.branch_name) {
-        bail!("Cannot delete the currently checked out branch '{}'", args.branch_name);
+        bail!(
+            "Cannot delete the currently checked out branch '{}'",
+            args.branch_name
+        );
     }
 
     // Load stack metadata
@@ -314,7 +351,11 @@ fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
     // Restack children onto the deleted branch's parent
     for child in &children {
         metadata.update_parent(child, parent.clone());
-        println!("Restacked '{}' onto '{}'", child, parent.as_deref().unwrap_or("main"));
+        println!(
+            "Restacked '{}' onto '{}'",
+            child,
+            parent.as_deref().unwrap_or("main")
+        );
     }
 
     // Delete the Git branch
@@ -326,7 +367,7 @@ fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
     if !args.force {
         // Try to delete with the unmerged check
         match branch.delete() {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 bail!(
                     "Branch '{}' has unmerged changes. Use `--force` to delete anyway.\nError: {}",
@@ -337,7 +378,8 @@ fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
         }
     } else {
         // Force delete
-        branch.delete()
+        branch
+            .delete()
             .with_context(|| format!("failed to delete branch '{}'", args.branch_name))?;
     }
 
@@ -359,46 +401,66 @@ fn handle_branch_delete(args: BranchDeleteArgs) -> Result<()> {
 }
 
 fn handle_branch_create(args: BranchCreateArgs) -> Result<()> {
-    let repo =
-        Repository::discover(".").context("`pk branch create` must be run inside a Git repository")?;
+    let repo = Repository::discover(".")
+        .context("`pk branch create` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
     let repo_root = workdir.to_path_buf();
+    ensure_initialized(&repo_root)?;
 
-    // Ensure Pancake is initialized
-    let config_path = repo_root.join(".pancake/config");
-    if !config_path.exists() {
-        bail!("Pancake is not initialized. Run `pk init` first.");
-    }
-
-    // Determine the base branch
-    let base_branch = match args.base {
-        Some(base) => {
-            // Verify the base branch exists
-            if !branch_exists(&repo, &base) {
-                bail!("Base branch '{}' does not exist", base);
-            }
-            base
-        }
-        None => {
-            // Use current branch as base
-            let head = repo.head().context("unable to resolve current HEAD")?;
-            if !head.is_branch() {
-                bail!("HEAD is not currently on a branch. Cannot determine base branch.");
-            }
-            head.shorthand()
-                .ok_or_else(|| anyhow!("unable to get current branch name"))?
-                .to_string()
-        }
-    };
-
-    // Check if the new branch already exists
     if branch_exists(&repo, &args.branch_name) {
         bail!("Branch '{}' already exists", args.branch_name);
     }
 
-    // Create the new branch
+    let mut metadata = StackMetadata::load(&repo_root)?;
+    let (base_branch, new_parent, children_to_reparent, action) =
+        if let Some(target) = args.insert_before {
+            if !branch_exists(&repo, &target) {
+                bail!("Target branch '{}' does not exist", target);
+            }
+            let target_parent = metadata
+                .get_parent(&target)
+                .ok_or_else(|| anyhow!("Target branch '{}' is not tracked by Pancake", target))?;
+            (
+                target_parent.clone(),
+                Some(target_parent),
+                vec![target.clone()],
+                format!("inserted before '{}'", target),
+            )
+        } else if let Some(target) = args.insert_after {
+            if !branch_exists(&repo, &target) {
+                bail!("Target branch '{}' does not exist", target);
+            }
+            if !metadata.branches.contains_key(&target) {
+                bail!("Target branch '{}' is not tracked by Pancake", target);
+            }
+            let children = metadata.get_children(&target);
+            (
+                target.clone(),
+                Some(target.clone()),
+                children,
+                format!("inserted after '{}'", target),
+            )
+        } else {
+            let base_branch = match args.base {
+                Some(base) => {
+                    if !branch_exists(&repo, &base) {
+                        bail!("Base branch '{}' does not exist", base);
+                    }
+                    base
+                }
+                None => current_branch_name(&repo)
+                    .context("HEAD is not currently on a branch. Cannot determine base branch.")?,
+            };
+            (
+                base_branch.clone(),
+                Some(base_branch),
+                Vec::new(),
+                String::new(),
+            )
+        };
+
     let base_commit = repo
         .find_branch(&base_branch, BranchType::Local)
         .with_context(|| format!("unable to find branch '{}'", base_branch))?
@@ -408,23 +470,88 @@ fn handle_branch_create(args: BranchCreateArgs) -> Result<()> {
 
     repo.branch(&args.branch_name, &base_commit, false)
         .with_context(|| format!("failed to create branch '{}'", args.branch_name))?;
+    checkout_branch(&repo, &args.branch_name)?;
 
-    // Checkout the new branch
-    repo.set_head(&format!("refs/heads/{}", args.branch_name))
-        .context("failed to set HEAD to new branch")?;
-    repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-        .context("failed to checkout new branch")?;
-
-    // Update stack metadata
-    let mut metadata = StackMetadata::load(&repo_root)?;
-    metadata.add_branch(args.branch_name.clone(), Some(base_branch.clone()));
+    metadata.add_branch(args.branch_name.clone(), new_parent.clone());
+    for child in &children_to_reparent {
+        metadata.update_parent(child, Some(args.branch_name.clone()));
+    }
     metadata.save(&repo_root)?;
 
-    println!(
-        "Created branch '{}' based on '{}' and switched to it",
-        args.branch_name, base_branch
-    );
+    if action.is_empty() {
+        println!(
+            "Created branch '{}' based on '{}' and switched to it",
+            args.branch_name, base_branch
+        );
+    } else {
+        println!(
+            "Created branch '{}' based on '{}' ({}) and switched to it",
+            args.branch_name, base_branch, action
+        );
+    }
 
+    Ok(())
+}
+
+fn handle_branch_rename(args: BranchRenameArgs) -> Result<()> {
+    let repo = Repository::discover(".")
+        .context("`pk branch rename` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+    ensure_initialized(&repo_root)?;
+
+    let current = current_branch_name(&repo).context("HEAD is not currently on a branch")?;
+    if branch_exists(&repo, &args.new_name) {
+        bail!("Branch '{}' already exists", args.new_name);
+    }
+
+    let mut metadata = StackMetadata::load(&repo_root)?;
+    if !metadata.branches.contains_key(&current) {
+        bail!("Current branch '{}' is not tracked by Pancake", current);
+    }
+
+    let mut branch = repo
+        .find_branch(&current, BranchType::Local)
+        .with_context(|| format!("unable to find branch '{}'", current))?;
+    branch.rename(&args.new_name, false).with_context(|| {
+        format!(
+            "failed to rename branch '{}' to '{}'",
+            current, args.new_name
+        )
+    })?;
+
+    metadata.rename_branch(&current, args.new_name.clone());
+    metadata.save(&repo_root)?;
+
+    println!("Renamed branch '{}' to '{}'", current, args.new_name);
+    Ok(())
+}
+
+fn handle_branch_checkout(args: BranchCheckoutArgs) -> Result<()> {
+    let repo = Repository::discover(".")
+        .context("`pk branch checkout` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+    ensure_initialized(&repo_root)?;
+
+    let current = current_branch_name(&repo).context("HEAD is not currently on a branch")?;
+    let metadata = StackMetadata::load(&repo_root)?;
+    let candidates = metadata.current_stack_branches(&current);
+    if candidates.is_empty() {
+        bail!("Current branch '{}' has no tracked stack", current);
+    }
+
+    let target = resolve_branch_query(&args.branch_name, &candidates)?;
+    if !branch_exists(&repo, &target) {
+        bail!("Branch '{}' does not exist", target);
+    }
+
+    checkout_branch(&repo, &target)?;
+    println!("Switched to branch '{}'", target);
     Ok(())
 }
 
@@ -486,7 +613,9 @@ fn handle_up(args: UpArgs) -> Result<()> {
 
             // For now, bail with a helpful message
             // In the future, we could use an interactive selector
-            bail!("Multiple children found. Interactive selection not yet implemented.\nUse `pk checkout <branch-name>` to select a specific branch.");
+            bail!(
+                "Multiple children found. Interactive selection not yet implemented.\nUse `pk checkout <branch-name>` to select a specific branch."
+            );
         }
     }
 
@@ -498,7 +627,8 @@ fn handle_up(args: UpArgs) -> Result<()> {
 }
 
 fn handle_down(args: DownArgs) -> Result<()> {
-    let repo = Repository::discover(".").context("`pk down` must be run inside a Git repository")?;
+    let repo =
+        Repository::discover(".").context("`pk down` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -585,7 +715,10 @@ fn handle_top() -> Result<()> {
 
     // Check if current branch is tracked
     if !metadata.branches.contains_key(&current_branch) {
-        bail!("Current branch '{}' is not tracked by Pancake", current_branch);
+        bail!(
+            "Current branch '{}' is not tracked by Pancake",
+            current_branch
+        );
     }
 
     // Find the top of the stack
@@ -604,7 +737,8 @@ fn handle_top() -> Result<()> {
 }
 
 fn handle_bottom() -> Result<()> {
-    let repo = Repository::discover(".").context("`pk bottom` must be run inside a Git repository")?;
+    let repo =
+        Repository::discover(".").context("`pk bottom` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -631,7 +765,10 @@ fn handle_bottom() -> Result<()> {
 
     // Check if current branch is tracked
     if !metadata.branches.contains_key(&current_branch) {
-        bail!("Current branch '{}' is not tracked by Pancake", current_branch);
+        bail!(
+            "Current branch '{}' is not tracked by Pancake",
+            current_branch
+        );
     }
 
     // Find the bottom of the stack
@@ -650,7 +787,8 @@ fn handle_bottom() -> Result<()> {
 }
 
 fn handle_commit(args: CommitArgs) -> Result<()> {
-    let repo = Repository::discover(".").context("`pk commit` must be run inside a Git repository")?;
+    let repo =
+        Repository::discover(".").context("`pk commit` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -683,19 +821,20 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
     // Stage changes if --all is specified
     if args.all {
         let mut index = repo.index().context("failed to get repository index")?;
-        index.add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
             .context("failed to stage changes")?;
         index.write().context("failed to write index")?;
     }
 
     // Get the signature for the commit
-    let signature = repo.signature()
-        .context("failed to get git signature. Ensure git user.name and user.email are configured.")?;
+    let signature = repo.signature().context(
+        "failed to get git signature. Ensure git user.name and user.email are configured.",
+    )?;
 
     if args.amend {
         // Amend the last commit
-        let head_commit = head.peel_to_commit()
-            .context("failed to get HEAD commit")?;
+        let head_commit = head.peel_to_commit().context("failed to get HEAD commit")?;
 
         // Get the current index tree
         let mut index = repo.index().context("failed to get repository index")?;
@@ -703,14 +842,16 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
         let tree = repo.find_tree(tree_oid).context("failed to find tree")?;
 
         // Amend the commit
-        head_commit.amend(
-            Some("HEAD"),
-            Some(&signature),
-            Some(&signature),
-            None,
-            Some(&message),
-            Some(&tree),
-        ).context("failed to amend commit")?;
+        head_commit
+            .amend(
+                Some("HEAD"),
+                Some(&signature),
+                Some(&signature),
+                None,
+                Some(&message),
+                Some(&tree),
+            )
+            .context("failed to amend commit")?;
 
         println!("Amended commit on branch '{}'", current_branch);
     } else {
@@ -720,7 +861,8 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
         let tree = repo.find_tree(tree_oid).context("failed to find tree")?;
 
         // Get the parent commit (HEAD)
-        let parent_commit = head.peel_to_commit()
+        let parent_commit = head
+            .peel_to_commit()
             .context("failed to get parent commit")?;
 
         // Create the commit
@@ -731,7 +873,8 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
             &message,
             &tree,
             &[&parent_commit],
-        ).context("failed to create commit")?;
+        )
+        .context("failed to create commit")?;
 
         println!("Created commit on branch '{}'", current_branch);
     }
@@ -740,7 +883,8 @@ fn handle_commit(args: CommitArgs) -> Result<()> {
 }
 
 fn handle_sync(args: SyncArgs) -> Result<()> {
-    let repo = Repository::discover(".").context("`pk sync` must be run inside a Git repository")?;
+    let repo =
+        Repository::discover(".").context("`pk sync` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -795,7 +939,10 @@ fn handle_sync(args: SyncArgs) -> Result<()> {
 
     let branches = collect_branch_sequence(&metadata, &start_branch);
     if branches.is_empty() {
-        bail!("No tracked branches to sync starting from '{}'", start_branch);
+        bail!(
+            "No tracked branches to sync starting from '{}'",
+            start_branch
+        );
     }
 
     let state = PendingOperation::new(OperationKind::Sync, branches, current_branch);
@@ -803,7 +950,8 @@ fn handle_sync(args: SyncArgs) -> Result<()> {
 }
 
 fn handle_restack(args: RestackArgs) -> Result<()> {
-    let repo = Repository::discover(".").context("`pk restack` must be run inside a Git repository")?;
+    let repo =
+        Repository::discover(".").context("`pk restack` must be run inside a Git repository")?;
     let workdir = repo
         .workdir()
         .context("bare repositories are not supported by Pancake")?;
@@ -896,6 +1044,46 @@ fn detect_remote(repo: &Repository) -> Option<String> {
 
 fn branch_exists(repo: &Repository, name: &str) -> bool {
     repo.find_branch(name, BranchType::Local).is_ok()
+}
+
+fn current_branch_name(repo: &Repository) -> Result<String> {
+    let head = repo.head().context("unable to resolve current HEAD")?;
+    if !head.is_branch() {
+        bail!("HEAD is not currently on a branch");
+    }
+    head.shorthand()
+        .map(|name| name.to_string())
+        .ok_or_else(|| anyhow!("unable to get current branch name"))
+}
+
+fn ensure_initialized(repo_root: &Path) -> Result<()> {
+    if !repo_root.join(".pancake/config").exists() {
+        bail!("Pancake is not initialized. Run `pk init` first.");
+    }
+    Ok(())
+}
+
+fn resolve_branch_query(query: &str, candidates: &[String]) -> Result<String> {
+    if candidates.iter().any(|candidate| candidate == query) {
+        return Ok(query.to_string());
+    }
+
+    let mut matches: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.contains(query))
+        .cloned()
+        .collect();
+    matches.sort();
+
+    match matches.len() {
+        0 => bail!("No branch matching '{}' in the current stack", query),
+        1 => Ok(matches.remove(0)),
+        _ => bail!(
+            "Branch query '{}' is ambiguous. Matches: {}",
+            query,
+            matches.join(", ")
+        ),
+    }
 }
 
 fn display_path(path: &Path) -> String {
@@ -1113,7 +1301,12 @@ fn process_pending_operation(
 
         let output = run_git_command(repo_root, &["rebase", parent.as_str()])?;
         if !output.status.success() {
-            return Err(build_rebase_failure_message(&branch, &parent, &state.kind, &output));
+            return Err(build_rebase_failure_message(
+                &branch,
+                &parent,
+                &state.kind,
+                &output,
+            ));
         }
 
         state.current_index += 1;
@@ -1274,8 +1467,8 @@ impl StackMetadata {
 
     fn save(&self, repo_root: &Path) -> Result<()> {
         let stacks_path = repo_root.join(".pancake/stacks.json");
-        let serialized = serde_json::to_string_pretty(self)
-            .context("failed to serialize stack metadata")?;
+        let serialized =
+            serde_json::to_string_pretty(self).context("failed to serialize stack metadata")?;
         fs::write(&stacks_path, serialized)
             .with_context(|| format!("failed to write {}", display_path(&stacks_path)))
     }
@@ -1311,6 +1504,36 @@ impl StackMetadata {
         if let Some(metadata) = self.branches.get_mut(branch_name) {
             metadata.parent = new_parent;
         }
+    }
+
+    fn rename_branch(&mut self, old_name: &str, new_name: String) {
+        if let Some(metadata) = self.branches.remove(old_name) {
+            self.branches.insert(new_name.clone(), metadata);
+        }
+
+        for branch in self.branches.values_mut() {
+            if branch.parent.as_deref() == Some(old_name) {
+                branch.parent = Some(new_name.clone());
+            }
+        }
+    }
+
+    fn current_stack_branches(&self, current: &str) -> Vec<String> {
+        let mut branches = if self.branches.contains_key(current) {
+            let bottom = self.find_stack_bottom(current);
+            collect_branch_sequence(self, &bottom)
+        } else {
+            let mut result = Vec::new();
+            let mut children = self.get_children(current);
+            children.sort();
+            for child in children {
+                result.extend(collect_branch_sequence(self, &child));
+            }
+            result
+        };
+        branches.sort();
+        branches.dedup();
+        branches
     }
 
     fn get_parent(&self, branch_name: &str) -> Option<String> {
@@ -1357,8 +1580,13 @@ struct BranchMetadata {
 
 #[derive(Debug)]
 enum StackRoot {
-    ExternalParent { name: String, children: Vec<BranchNode> },
-    Standalone { node: BranchNode },
+    ExternalParent {
+        name: String,
+        children: Vec<BranchNode>,
+    },
+    Standalone {
+        node: BranchNode,
+    },
 }
 
 #[derive(Debug)]
@@ -1480,7 +1708,12 @@ fn render_children(children: &[BranchNode], color: colored::Color) {
 
 fn render_branch(node: &BranchNode, prefix: &str, is_last: bool, color: colored::Color) {
     let connector = if is_last { "`--" } else { "|--" };
-    println!("{}{} {}", prefix.color(color), connector.color(color), node.name.color(color));
+    println!(
+        "{}{} {}",
+        prefix.color(color),
+        connector.color(color),
+        node.name.color(color)
+    );
 
     let next_prefix = if is_last {
         format!("{prefix}    ")
