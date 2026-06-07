@@ -1007,6 +1007,24 @@ fn handle_restack(args: RestackArgs) -> Result<()> {
     execute_operation(&repo, &repo_root, &metadata, state)
 }
 
+fn read_pancake_config(repo_root: &Path) -> Result<PancakeConfigRead> {
+    let path = repo_root.join(".pancake/config");
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read {}", display_path(&path)))?;
+    toml::from_str(&contents).with_context(|| format!("failed to parse {}", display_path(&path)))
+}
+
+#[derive(Deserialize)]
+struct PancakeConfigRead {
+    repository: RepositoryConfigRead,
+}
+
+#[derive(Deserialize)]
+struct RepositoryConfigRead {
+    main_branch: String,
+    remote: String,
+}
+
 fn checkout_branch(repo: &Repository, branch_name: &str) -> Result<()> {
     repo.set_head(&format!("refs/heads/{}", branch_name))
         .with_context(|| format!("failed to set HEAD to branch '{}'", branch_name))?;
@@ -1479,6 +1497,8 @@ impl StackMetadata {
             BranchMetadata {
                 parent,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                pr_number: None,
+                pr_url: None,
             },
         );
     }
@@ -1576,6 +1596,10 @@ impl StackMetadata {
 struct BranchMetadata {
     parent: Option<String>,
     created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pr_url: Option<String>,
 }
 
 #[derive(Debug)]
