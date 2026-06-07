@@ -42,6 +42,7 @@ impl Cli {
             Commands::Commit(args) => handle_commit(args),
             Commands::Sync(args) => handle_sync(args),
             Commands::Restack(args) => handle_restack(args),
+            Commands::Submit(args) => handle_submit(args),
         }
     }
 }
@@ -85,6 +86,9 @@ enum Commands {
     Sync(SyncArgs),
     /// Restack the entire stack from bottom to top
     Restack(RestackArgs),
+    /// Create or update pull requests for branches in the stack
+    #[command(alias = "pr")]
+    Submit(SubmitArgs),
 }
 
 #[derive(Args)]
@@ -217,6 +221,25 @@ struct RestackArgs {
     /// Abort the in-progress restack
     #[arg(long)]
     abort: bool,
+}
+
+#[derive(Args)]
+struct SubmitArgs {
+    /// Submit every branch in the current stack (start from the bottom)
+    #[arg(long)]
+    all: bool,
+    /// Submit branches starting from the specified branch upward
+    #[arg(long, value_name = "BRANCH", conflicts_with = "all")]
+    from: Option<String>,
+    /// Create the pull requests as drafts
+    #[arg(long)]
+    draft: bool,
+    /// Skip interactive PR description editing (use the auto-generated body)
+    #[arg(long = "no-edit")]
+    no_edit: bool,
+    /// Print the planned actions without contacting the remote or `gh`
+    #[arg(long = "dry-run")]
+    dry_run: bool,
 }
 
 fn handle_init(args: InitArgs) -> Result<()> {
@@ -1005,6 +1028,108 @@ fn handle_restack(args: RestackArgs) -> Result<()> {
 
     let state = PendingOperation::new(OperationKind::Restack, branches, current_branch);
     execute_operation(&repo, &repo_root, &metadata, state)
+}
+
+fn handle_submit(args: SubmitArgs) -> Result<()> {
+    let repo =
+        Repository::discover(".").context("`pk submit` must be run inside a Git repository")?;
+    let workdir = repo
+        .workdir()
+        .context("bare repositories are not supported by Pancake")?;
+    let repo_root = workdir.to_path_buf();
+
+    ensure_initialized(&repo_root)?;
+
+    let config = read_pancake_config(&repo_root)?;
+    let mut metadata = StackMetadata::load(&repo_root)?;
+    let current_branch = current_branch_name(&repo)?;
+
+    let start_branch = if let Some(ref name) = args.from {
+        if !metadata.branches.contains_key(name) {
+            bail!("Branch '{}' is not tracked by Pancake", name);
+        }
+        name.clone()
+    } else if args.all {
+        if !metadata.branches.contains_key(&current_branch) {
+            bail!(
+                "Current branch '{}' is not tracked by Pancake",
+                current_branch
+            );
+        }
+        metadata.find_stack_bottom(&current_branch)
+    } else {
+        if !metadata.branches.contains_key(&current_branch) {
+            bail!(
+                "Current branch '{}' is not tracked by Pancake",
+                current_branch
+            );
+        }
+        current_branch.clone()
+    };
+
+    let branches: Vec<String> = if args.all || args.from.is_some() {
+        collect_branch_sequence(&metadata, &start_branch)
+    } else {
+        vec![start_branch.clone()]
+    };
+
+    if branches.is_empty() {
+        bail!("No tracked branches to submit");
+    }
+
+    let main_branch = config.repository.main_branch.clone();
+    let remote = config.repository.remote.clone();
+    let gh = gh_bin();
+
+    if args.dry_run {
+        for branch in &branches {
+            let parent = metadata
+                .get_parent(branch)
+                .unwrap_or_else(|| main_branch.clone());
+            println!("Would submit '{}' (base: '{}')", branch, parent);
+        }
+        println!(
+            "Dry run complete. {} branch(es) would be submitted.",
+            branches.len()
+        );
+        return Ok(());
+    }
+
+    let _ = args.no_edit;
+
+    for branch in &branches {
+        let parent = metadata
+            .get_parent(branch)
+            .unwrap_or_else(|| main_branch.clone());
+
+        push_branch(&repo_root, &remote, branch)?;
+
+        let title = branch_title(&repo, branch).unwrap_or_else(|_| branch.to_string());
+        let body = generate_stack_body(&metadata, branch, &branches);
+
+        let (pr_number, pr_url) = match find_existing_pr(&repo_root, &gh, branch)? {
+            Some((num, url)) => {
+                update_pr(&repo_root, &gh, num, &parent, &body)?;
+                println!("Updated PR #{} for '{}': {}", num, branch, url);
+                (num, url)
+            }
+            None => {
+                let (num, url) =
+                    create_pr(&repo_root, &gh, branch, &parent, &title, &body, args.draft)?;
+                println!("Created PR #{} for '{}': {}", num, branch, url);
+                (num, url)
+            }
+        };
+
+        if let Some(meta) = metadata.branches.get_mut(branch) {
+            meta.pr_number = Some(pr_number);
+            meta.pr_url = Some(pr_url);
+        }
+        metadata.save(&repo_root)?;
+    }
+
+    println!("Submitted {} branch(es).", branches.len());
+    Ok(())
 }
 
 fn read_pancake_config(repo_root: &Path) -> Result<PancakeConfigRead> {
