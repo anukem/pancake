@@ -1025,6 +1025,179 @@ struct RepositoryConfigRead {
     remote: String,
 }
 
+fn gh_bin() -> String {
+    std::env::var("PANCAKE_GH_BIN").unwrap_or_else(|_| "gh".to_string())
+}
+
+fn push_branch(repo_root: &Path, remote: &str, branch: &str) -> Result<()> {
+    let args = [
+        "push",
+        "--force-with-lease",
+        "--set-upstream",
+        remote,
+        branch,
+    ];
+    let output = run_git_command(repo_root, &args)?;
+    if !output.status.success() {
+        return Err(format_git_error(&args, &output));
+    }
+    Ok(())
+}
+
+fn find_existing_pr(repo_root: &Path, gh: &str, branch: &str) -> Result<Option<(u64, String)>> {
+    let output = Command::new(gh)
+        .args(["pr", "view", branch, "--json", "number,url"])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run `{} pr view`", gh))?;
+
+    if output.status.success() {
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("failed to parse `gh pr view` JSON output")?;
+        let number = json
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("`gh pr view` response missing 'number' field"))?;
+        let url = json
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("`gh pr view` response missing 'url' field"))?
+            .to_string();
+        return Ok(Some((number, url)));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr.contains("no pull request")
+        || stderr.contains("not found")
+        || stderr.contains("could not find")
+    {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "`{} pr view {}` failed: {}",
+        gh,
+        branch,
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn create_pr(
+    repo_root: &Path,
+    gh: &str,
+    branch: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+    draft: bool,
+) -> Result<(u64, String)> {
+    let mut cmd_args: Vec<&str> = vec![
+        "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body,
+    ];
+    if draft {
+        cmd_args.push("--draft");
+    }
+    let output = Command::new(gh)
+        .args(&cmd_args)
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run `{} pr create`", gh))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{} pr create` failed: {}",
+            gh,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let url = stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("http"))
+        .ok_or_else(|| anyhow!("`gh pr create` did not return a PR URL"))?
+        .to_string();
+    let number = parse_pr_number_from_url(&url)
+        .ok_or_else(|| anyhow!("unable to parse PR number from URL: {}", url))?;
+    Ok((number, url))
+}
+
+fn update_pr(repo_root: &Path, gh: &str, number: u64, base: &str, body: &str) -> Result<()> {
+    let number_str = number.to_string();
+    let output = Command::new(gh)
+        .args([
+            "pr",
+            "edit",
+            number_str.as_str(),
+            "--base",
+            base,
+            "--body",
+            body,
+        ])
+        .current_dir(repo_root)
+        .output()
+        .with_context(|| format!("failed to run `{} pr edit`", gh))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`{} pr edit {}` failed: {}",
+            gh,
+            number,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn parse_pr_number_from_url(url: &str) -> Option<u64> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+}
+
+fn branch_title(repo: &Repository, branch: &str) -> Result<String> {
+    let branch_ref = repo
+        .find_branch(branch, BranchType::Local)
+        .with_context(|| format!("unable to find branch '{}'", branch))?;
+    let commit = branch_ref
+        .get()
+        .peel_to_commit()
+        .with_context(|| format!("unable to read tip commit of '{}'", branch))?;
+    Ok(commit
+        .summary()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| branch.to_string()))
+}
+
+fn generate_stack_body(metadata: &StackMetadata, branch: &str, fallback: &[String]) -> String {
+    let mut lines = Vec::new();
+    lines.push("<!-- pancake:stack -->".to_string());
+    lines.push("## Stack".to_string());
+    lines.push(String::new());
+
+    let stack_branches: Vec<String> = if metadata.branches.contains_key(branch) {
+        let bottom = metadata.find_stack_bottom(branch);
+        collect_branch_sequence(metadata, &bottom)
+    } else {
+        fallback.to_vec()
+    };
+
+    for b in &stack_branches {
+        let marker = if b == branch { "👉" } else { "  " };
+        let pr_suffix = metadata
+            .branches
+            .get(b)
+            .and_then(|m| m.pr_url.as_deref())
+            .map(|url| format!(" ({})", url))
+            .unwrap_or_default();
+        lines.push(format!("- {} `{}`{}", marker, b, pr_suffix));
+    }
+
+    lines.push(String::new());
+    lines.push("<!-- /pancake:stack -->".to_string());
+    lines.join("\n")
+}
+
 fn checkout_branch(repo: &Repository, branch_name: &str) -> Result<()> {
     repo.set_head(&format!("refs/heads/{}", branch_name))
         .with_context(|| format!("failed to set HEAD to branch '{}'", branch_name))?;
